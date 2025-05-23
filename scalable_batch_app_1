@@ -1,0 +1,369 @@
+# Production-Ready Spring Batch 5.2 Migration Application
+
+This design outlines a scalable, generic architecture for a Spring Batch 5.2 application that handles multiple migration jobs from DB2 to CSV files, with H2 for batch metadata storage.
+
+## Architecture Overview
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                     Migration Application                       │
+│                                                               │
+│  ┌─────────────┐    ┌───────────────────┐    ┌─────────────┐  │
+│  │  Job Config │    │ Generic Components │    │ DB2 Reader │  │
+│  │  (Multiple) │    │ (Reusable)         │    │ (JdbcTemp) │  │
+│  └─────────────┘    └───────────────────┘    └─────────────┘  │
+│           │               ▲               │                    │
+│           ▼               │               ▼                    │
+│  ┌─────────────┐    ┌─────┴─────┐    ┌─────────────┐          │
+│  │ Job Launcher │◄──┤Job Factory├───►│ CSV Writer  │          │
+│  └─────────────┘    └───────────┘    └─────────────┘          │
+│                                                               │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │                     Batch Metadata                      │  │
+│  │                    (H2 Database)                       │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────┘
+```
+
+## Key Components
+
+### 1. Database Configuration
+
+```java
+@Configuration
+public class DataSourceConfig {
+
+    // DB2 DataSource for source data
+    @Bean
+    @ConfigurationProperties(prefix = "db2.datasource")
+    public DataSource db2DataSource() {
+        return DataSourceBuilder.create().build();
+    }
+
+    // H2 DataSource for Spring Batch metadata
+    @Bean
+    @ConfigurationProperties(prefix = "spring.datasource")
+    @BatchDataSource
+    public DataSource batchDataSource() {
+        return DataSourceBuilder.create().build();
+    }
+
+    // JdbcTemplate for DB2 operations
+    @Bean
+    public JdbcTemplate db2JdbcTemplate(@Qualifier("db2DataSource") DataSource dataSource) {
+        return new JdbcTemplate(dataSource);
+    }
+}
+```
+
+### 2. Generic Item Reader
+
+```java
+public class GenericDb2ItemReader<T> extends AbstractCursorItemReader<T> {
+    
+    private final RowMapper<T> rowMapper;
+    private final String query;
+    private final JdbcTemplate jdbcTemplate;
+    
+    public GenericDb2ItemReader(JdbcTemplate jdbcTemplate, String query, RowMapper<T> rowMapper) {
+        this.jdbcTemplate = jdbcTemplate;
+        this.query = query;
+        this.rowMapper = rowMapper;
+        setName(getClass().getSimpleName());
+    }
+    
+    @Override
+    protected void doOpen() throws Exception {
+        super.doOpen();
+        jdbcTemplate.setFetchSize(getFetchSize());
+    }
+    
+    @Override
+    protected T doRead() throws Exception {
+        if (rs == null) {
+            rs = jdbcTemplate.queryForRowSet(query);
+        }
+        
+        if (!rs.next()) {
+            return null;
+        }
+        
+        return rowMapper.mapRow(rs, 0);
+    }
+    
+    @Override
+    protected void doClose() throws Exception {
+        if (rs != null) {
+            rs.close();
+        }
+        super.doClose();
+    }
+}
+```
+
+### 3. Generic CSV Item Writer
+
+```java
+public class GenericCsvItemWriter<T> implements ItemStreamWriter<T> {
+    
+    private final FlatFileItemWriter<T> delegate;
+    private final Resource outputResource;
+    private final LineAggregator<T> lineAggregator;
+    
+    public GenericCsvItemWriter(Resource outputResource, LineAggregator<T> lineAggregator) {
+        this.outputResource = outputResource;
+        this.lineAggregator = lineAggregator;
+        this.delegate = new FlatFileItemWriterBuilder<T>()
+            .name("genericCsvItemWriter")
+            .resource(outputResource)
+            .lineAggregator(lineAggregator)
+            .headerCallback(writer -> writeHeader(writer))
+            .shouldDeleteIfEmpty(true)
+            .shouldDeleteIfExists(true)
+            .build();
+    }
+    
+    protected void writeHeader(Writer writer) throws IOException {
+        // Can be overridden by subclasses for custom headers
+    }
+    
+    @Override
+    public void write(List<? extends T> items) throws Exception {
+        delegate.write(items);
+    }
+    
+    @Override
+    public void open(ExecutionContext executionContext) throws ItemStreamException {
+        delegate.open(executionContext);
+    }
+    
+    @Override
+    public void update(ExecutionContext executionContext) throws ItemStreamException {
+        delegate.update(executionContext);
+    }
+    
+    @Override
+    public void close() throws ItemStreamException {
+        delegate.close();
+    }
+}
+```
+
+### 4. Job Configuration Factory
+
+```java
+@Configuration
+public class JobConfiguration {
+    
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+    
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+    
+    @Autowired
+    private JdbcTemplate db2JdbcTemplate;
+    
+    @Value("${batch.output.directory}")
+    private Resource outputDirectory;
+    
+    @Bean
+    public JobRegistryBeanPostProcessor jobRegistryBeanPostProcessor(JobRegistry jobRegistry) {
+        JobRegistryBeanPostProcessor processor = new JobRegistryBeanPostProcessor();
+        processor.setJobRegistry(jobRegistry);
+        return processor;
+    }
+    
+    // Example job configuration - can be extended for multiple jobs
+    @Bean
+    public Job customerMigrationJob() {
+        return jobBuilderFactory.get("customerMigrationJob")
+            .incrementer(new RunIdIncrementer())
+            .start(customerMigrationStep())
+            .build();
+    }
+    
+    @Bean
+    public Step customerMigrationStep() {
+        return stepBuilderFactory.get("customerMigrationStep")
+            .<Customer, Customer>chunk(100)
+            .reader(customerReader())
+            .writer(customerWriter())
+            .listener(new StepExecutionListener() {
+                @Override
+                public void beforeStep(StepExecution stepExecution) {
+                    // Initialize step context if needed
+                }
+                
+                @Override
+                public ExitStatus afterStep(StepExecution stepExecution) {
+                    return stepExecution.getExitStatus();
+                }
+            })
+            .build();
+    }
+    
+    @Bean
+    public ItemReader<Customer> customerReader() {
+        String query = "SELECT id, name, email FROM customers WHERE status = 'ACTIVE'";
+        return new GenericDb2ItemReader<>(db2JdbcTemplate, query, new BeanPropertyRowMapper<>(Customer.class));
+    }
+    
+    @Bean
+    public ItemWriter<Customer> customerWriter() {
+        Resource outputResource = outputDirectory.createRelative("customers_" + System.currentTimeMillis() + ".csv");
+        
+        return new GenericCsvItemWriter<>(outputResource, new BeanWrapperFieldExtractor<Customer>() {{
+            setNames(new String[]{"id", "name", "email"});
+        }});
+    }
+}
+```
+
+### 5. Batch Configuration
+
+```java
+@Configuration
+@EnableBatchProcessing
+public class BatchConfig extends DefaultBatchConfigurer {
+    
+    @Autowired
+    private DataSource batchDataSource;
+    
+    @Override
+    public void setDataSource(DataSource dataSource) {
+        // Override to not set the dataSource on the job repository
+    }
+    
+    @Bean
+    public BatchConfigurer batchConfigurer() {
+        return new DefaultBatchConfigurer(batchDataSource) {
+            @Override
+            public PlatformTransactionManager getTransactionManager() {
+                return new DataSourceTransactionManager(batchDataSource);
+            }
+        };
+    }
+    
+    @Bean
+    public JobExplorer jobExplorer() throws Exception {
+        JobExplorerFactoryBean factoryBean = new JobExplorerFactoryBean();
+        factoryBean.setDataSource(batchDataSource);
+        factoryBean.setTablePrefix("BATCH_");
+        factoryBean.afterPropertiesSet();
+        return factoryBean.getObject();
+    }
+    
+    @Bean
+    public JobLauncher jobLauncher(JobRepository jobRepository) {
+        SimpleJobLauncher jobLauncher = new SimpleJobLauncher();
+        jobLauncher.setJobRepository(jobRepository);
+        jobLauncher.setTaskExecutor(new SimpleAsyncTaskExecutor());
+        return jobLauncher;
+    }
+}
+```
+
+### 6. Application Properties
+
+```properties
+# DB2 Configuration
+db2.datasource.url=jdbc:db2://hostname:port/database
+db2.datasource.username=username
+db2.datasource.password=password
+db2.datasource.driver-class-name=com.ibm.db2.jcc.DB2Driver
+
+# H2 Configuration
+spring.datasource.url=jdbc:h2:file:./data/batch-metadata;DB_CLOSE_ON_EXIT=FALSE;AUTO_SERVER=TRUE
+spring.datasource.username=sa
+spring.datasource.password=
+spring.datasource.driver-class-name=org.h2.Driver
+
+# Batch Configuration
+spring.batch.job.enabled=false
+spring.batch.initialize-schema=always
+spring.batch.table-prefix=BATCH_
+
+# Output Configuration
+batch.output.directory=file:./output/
+```
+
+## Scaling Considerations
+
+1. **Partitioning**: For large datasets, implement partitioned steps:
+
+```java
+@Bean
+public Step partitionedStep() {
+    return stepBuilderFactory.get("partitionedStep")
+        .partitioner("slaveStep", columnRangePartitioner())
+        .step(slaveStep())
+        .gridSize(10)
+        .taskExecutor(new SimpleAsyncTaskExecutor())
+        .build();
+}
+```
+
+2. **Remote Chunking**: For distributed processing, consider Spring Batch Remote Chunking.
+
+3. **Monitoring**: Expose batch metrics via Spring Boot Actuator.
+
+4. **Restartability**: Configure job parameters to support restartability.
+
+## Error Handling
+
+```java
+@Bean
+public Step errorHandlingStep() {
+    return stepBuilderFactory.get("errorHandlingStep")
+        .<Customer, Customer>chunk(100)
+        .reader(reader())
+        .writer(writer())
+        .faultTolerant()
+        .skipLimit(100)
+        .skip(DataIntegrityViolationException.class)
+        .skip(FlatFileParseException.class)
+        .retryLimit(3)
+        .retry(DeadlockLoserDataAccessException.class)
+        .listener(new ItemProcessListener<Customer, Customer>() {
+            @Override
+            public void beforeProcess(Customer item) {
+                // Pre-processing
+            }
+            
+            @Override
+            public void afterProcess(Customer item, Customer result) {
+                // Post-processing
+            }
+            
+            @Override
+            public void onProcessError(Customer item, Exception e) {
+                // Error handling
+            }
+        })
+        .build();
+}
+```
+
+## Testing Considerations
+
+```java
+@SpringBatchTest
+@SpringBootTest
+public class BatchJobTest {
+    
+    @Autowired
+    private JobLauncherTestUtils jobLauncherTestUtils;
+    
+    @Test
+    public void testJob() throws Exception {
+        JobExecution jobExecution = jobLauncherTestUtils.launchJob();
+        
+        assertEquals(BatchStatus.COMPLETED, jobExecution.getStatus());
+        
+        // Verify output file exists and contains expected data
+    }
+}
+```
+
+This architecture provides a production-ready, scalable solution for multiple DB2 to CSV migration jobs using Spring Batch 5.2 with H2 for metadata storage. The generic components can be easily extended for different data models and migration requirements.
