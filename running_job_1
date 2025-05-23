@@ -1,0 +1,184 @@
+# Running Spring Batch Jobs from Command Line
+
+Yes, you can absolutely run your Spring Batch jobs from the command line using the application JAR. Here's how to enhance your application to support command-line execution:
+
+## 1. Add Command Line Support
+
+First, modify your main application class to handle command-line arguments:
+
+```java
+@SpringBootApplication
+public class MigrationApplication implements CommandLineRunner {
+
+    @Autowired
+    private JobLauncher jobLauncher;
+    
+    @Autowired
+    private ApplicationContext context;
+    
+    public static void main(String[] args) {
+        SpringApplication.run(MigrationApplication.class, args);
+    }
+    
+    @Override
+    public void run(String... args) throws Exception {
+        if (args.length == 0) {
+            System.out.println("Usage: java -jar your-app.jar jobName [param1=value1 param2=value2 ...]");
+            System.out.println("Available jobs:");
+            for (String jobName : context.getBeanNamesForType(Job.class)) {
+                System.out.println("- " + jobName);
+            }
+            return;
+        }
+        
+        String jobName = args[0];
+        Job job = context.getBean(jobName, Job.class);
+        
+        JobParametersBuilder jobParametersBuilder = new JobParametersBuilder();
+        
+        // Add system parameters (like timestamp)
+        jobParametersBuilder.addLong("time", System.currentTimeMillis());
+        
+        // Parse additional parameters (param1=value1 param2=value2)
+        for (int i = 1; i < args.length; i++) {
+            String[] param = args[i].split("=");
+            if (param.length == 2) {
+                jobParametersBuilder.addString(param[0], param[1]);
+            }
+        }
+        
+        JobExecution execution = jobLauncher.run(job, jobParametersBuilder.toJobParameters());
+        
+        System.out.println("Job Status: " + execution.getStatus());
+        System.out.println("Job completed with exit code: " + execution.getExitStatus().getExitCode());
+    }
+}
+```
+
+## 2. Build the Executable JAR
+
+Make sure your `pom.xml` (for Maven) or `build.gradle` (for Gradle) is configured to build an executable JAR:
+
+### Maven Example:
+
+```xml
+<build>
+    <plugins>
+        <plugin>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-maven-plugin</artifactId>
+            <configuration>
+                <executable>true</executable>
+            </configuration>
+        </plugin>
+    </plugins>
+</build>
+```
+
+### Gradle Example:
+
+```groovy
+bootJar {
+    launchScript()
+}
+```
+
+## 3. Running Jobs from Command Line
+
+After building the JAR (`mvn clean package` or `gradle bootJar`), you can run jobs like this:
+
+```bash
+# List available jobs
+java -jar your-application.jar
+
+# Run a specific job
+java -jar your-application.jar customerMigrationJob
+
+# Run with parameters
+java -jar your-application.jar customerMigrationJob startDate=2023-01-01 endDate=2023-12-31
+
+# Run with multiple parameters
+java -jar your-application.jar productMigrationJob category=ELECTRONICS outputFile=products_electronics.csv
+```
+
+## 4. Advanced Command Line Options
+
+For more sophisticated command-line handling, consider using Spring Boot's `ApplicationRunner` or a library like Picocli:
+
+```java
+@Component
+public class JobCommandLineRunner implements ApplicationRunner {
+    
+    @Autowired
+    private JobLauncher jobLauncher;
+    
+    @Autowired
+    private ApplicationContext context;
+    
+    @Override
+    public void run(ApplicationArguments args) throws Exception {
+        if (!args.containsOption("job")) {
+            System.out.println("Usage: --job=<jobName> [--param1=value1 --param2=value2]");
+            return;
+        }
+        
+        String jobName = args.getOptionValues("job").get(0);
+        Job job = context.getBean(jobName, Job.class);
+        
+        JobParametersBuilder jobParametersBuilder = new JobParametersBuilder();
+        
+        // Add timestamp
+        jobParametersBuilder.addLong("time", System.currentTimeMillis());
+        
+        // Add all non-job parameters
+        for (String name : args.getOptionNames()) {
+            if (!name.equals("job")) {
+                jobParametersBuilder.addString(name, args.getOptionValues(name).get(0));
+            }
+        }
+        
+        JobExecution execution = jobLauncher.run(job, jobParametersBuilder.toJobParameters());
+        
+        System.out.println("Job Execution Status: " + execution.getStatus());
+    }
+}
+```
+
+Then you can run with:
+
+```bash
+java -jar your-application.jar --job=customerMigrationJob --startDate=2023-01-01 --endDate=2023-12-31
+```
+
+## 5. Making the JAR Executable (Linux/Unix)
+
+If you're deploying on Linux/Unix, you can make the JAR directly executable:
+
+```bash
+# After building with the Spring Boot Maven/Gradle plugin
+chmod +x your-application.jar
+
+# Then run directly
+./your-application.jar customerMigrationJob
+```
+
+## 6. Exit Codes
+
+Spring Batch provides exit codes that can be useful for scripting:
+
+- `COMPLETED`: Exit code 0
+- `FAILED`: Exit code 1
+- `STOPPED`: Exit code 2
+
+You can check the exit code in shell scripts:
+
+```bash
+java -jar your-application.jar customerMigrationJob
+if [ $? -eq 0 ]; then
+    echo "Job completed successfully"
+else
+    echo "Job failed"
+fi
+```
+
+This approach gives you flexible command-line control over your batch jobs while maintaining all the production-ready features of your Spring Batch application.
