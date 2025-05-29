@@ -1,0 +1,245 @@
+# Reading Data from DB2 in Spring Batch 5.2 for Flat File Generation
+
+Here's a complete implementation for creating a flat file with data rows read from a DB2 database, along with custom header and footer rows.
+
+## 1. Configuration Class (Updated for DB2)
+
+```java
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.database.JdbcCursorItemReader;
+import org.springframework.batch.item.database.builder.JdbcCursorItemReaderBuilder;
+import org.springframework.batch.item.file.FlatFileItemWriter;
+import org.springframework.batch.item.file.builder.FlatFileItemWriterBuilder;
+import org.springframework.batch.item.file.transform.BeanWrapperFieldExtractor;
+import org.springframework.batch.item.file.transform.DelimitedLineAggregator;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import javax.sql.DataSource;
+
+@Configuration
+public class Db2ToFlatFileConfig {
+
+    @Bean
+    public Job db2ToFlatFileJob(JobRepository jobRepository, Step exportDataStep) {
+        return new JobBuilder("db2ToFlatFileJob", jobRepository)
+                .start(exportDataStep)
+                .build();
+    }
+
+    @Bean
+    public Step exportDataStep(JobRepository jobRepository,
+                             PlatformTransactionManager transactionManager,
+                             JdbcCursorItemReader<YourDataModel> db2Reader,
+                             FlatFileItemWriter<YourDataModel> flatFileWriter) {
+        return new StepBuilder("exportDataStep", jobRepository)
+                .<YourDataModel, YourDataModel>chunk(100, transactionManager)
+                .reader(db2Reader)
+                .writer(flatFileWriter)
+                .build();
+    }
+
+    @Bean
+    public JdbcCursorItemReader<YourDataModel> db2Reader(DataSource dataSource) {
+        return new JdbcCursorItemReaderBuilder<YourDataModel>()
+                .name("db2Reader")
+                .dataSource(dataSource)
+                .sql("SELECT column1, column2, column3 FROM your_table WHERE condition = ?")
+                .queryArguments("your_parameter_value") // Optional parameters
+                .rowMapper(new YourDataRowMapper()) // Implement row mapper
+                .build();
+    }
+
+    @Bean
+    public FlatFileItemWriter<YourDataModel> flatFileWriter() {
+        return new FlatFileItemWriterBuilder<YourDataModel>()
+                .name("flatFileWriter")
+                .resource(new FileSystemResource("output/db2_export.txt"))
+                .headerCallback(new CustomHeaderCallback())
+                .footerCallback(new CustomFooterCallback())
+                .lineAggregator(new DelimitedLineAggregator<YourDataModel>() {{
+                    setDelimiter("|");
+                    setFieldExtractor(new BeanWrapperFieldExtractor<YourDataModel>() {{
+                        setNames(new String[]{"field1", "field2", "field3"}); // Match YourDataModel properties
+                    }});
+                }})
+                .build();
+    }
+}
+```
+
+## 2. Data Model Class
+
+```java
+public class YourDataModel {
+    private String field1;
+    private String field2;
+    private String field3;
+    
+    // Constructors, getters, and setters
+    public YourDataModel() {}
+    
+    public YourDataModel(String field1, String field2, String field3) {
+        this.field1 = field1;
+        this.field2 = field2;
+        this.field3 = field3;
+    }
+    
+    // Getters and setters
+    public String getField1() { return field1; }
+    public void setField1(String field1) { this.field1 = field1; }
+    
+    public String getField2() { return field2; }
+    public void setField2(String field2) { this.field2 = field2; }
+    
+    public String getField3() { return field3; }
+    public void setField3(String field3) { this.field3 = field3; }
+}
+```
+
+## 3. Row Mapper Implementation
+
+```java
+import org.springframework.jdbc.core.RowMapper;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+public class YourDataRowMapper implements RowMapper<YourDataModel> {
+
+    @Override
+    public YourDataModel mapRow(ResultSet rs, int rowNum) throws SQLException {
+        return new YourDataModel(
+            rs.getString("column1"),
+            rs.getString("column2"),
+            rs.getString("column3")
+        );
+    }
+}
+```
+
+## 4. Header and Footer Callbacks (Updated)
+
+```java
+// CustomHeaderCallback.java
+import org.springframework.batch.item.file.FlatFileHeaderCallback;
+import java.io.IOException;
+import java.io.Writer;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+
+public class CustomHeaderCallback implements FlatFileHeaderCallback {
+    @Override
+    public void writeHeader(Writer writer) throws IOException {
+        String currentDate = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        writer.write("HEADER|EXPORT_DATE|" + currentDate + "|DB2_SCHEMA|YOUR_SCHEMA");
+    }
+}
+
+// CustomFooterCallback.java
+import org.springframework.batch.item.file.FlatFileFooterCallback;
+import org.springframework.batch.item.file.FlatFileItemWriter;
+import org.springframework.lang.Nullable;
+import java.io.IOException;
+import java.io.Writer;
+
+public class CustomFooterCallback implements FlatFileFooterCallback {
+    private int recordCount = 0;
+
+    public void setRecordCount(int count) {
+        this.recordCount = count;
+    }
+
+    @Override
+    public void writeFooter(Writer writer) throws IOException {
+        writer.write("FOOTER|TOTAL_RECORDS|" + recordCount + "|END_OF_FILE");
+    }
+}
+```
+
+## 5. DB2 DataSource Configuration
+
+Add to your `application.properties` or `application.yml`:
+
+```properties
+# DB2 Connection Properties
+spring.datasource.url=jdbc:db2://your.db2.server:50000/YOUR_DB
+spring.datasource.username=your_username
+spring.datasource.password=your_password
+spring.datasource.driver-class-name=com.ibm.db2.jcc.DB2Driver
+
+# Spring Batch Properties
+spring.batch.job.enabled=true
+spring.batch.initialize-schema=always
+```
+
+## 6. Listener for Record Count (Optional)
+
+```java
+import org.springframework.batch.core.ItemWriteListener;
+import java.util.List;
+
+public class RecordCountListener implements ItemWriteListener<YourDataModel> {
+    private final CustomFooterCallback footerCallback;
+
+    public RecordCountListener(CustomFooterCallback footerCallback) {
+        this.footerCallback = footerCallback;
+    }
+
+    @Override
+    public void beforeWrite(List<? extends YourDataModel> items) {}
+
+    @Override
+    public void afterWrite(List<? extends YourDataModel> items) {
+        footerCallback.setRecordCount(footerCallback.getRecordCount() + items.size());
+    }
+
+    @Override
+    public void onWriteError(Exception exception, List<? extends YourDataModel> items) {}
+}
+```
+
+## 7. Update Configuration to Include Listener
+
+```java
+@Bean
+public Step exportDataStep(JobRepository jobRepository,
+                         PlatformTransactionManager transactionManager,
+                         JdbcCursorItemReader<YourDataModel> db2Reader,
+                         FlatFileItemWriter<YourDataModel> flatFileWriter,
+                         CustomFooterCallback footerCallback) {
+    return new StepBuilder("exportDataStep", jobRepository)
+            .<YourDataModel, YourDataModel>chunk(100, transactionManager)
+            .reader(db2Reader)
+            .writer(flatFileWriter)
+            .listener(new RecordCountListener(footerCallback))
+            .build();
+}
+```
+
+## Key Considerations:
+
+1. **DB2 Specifics**:
+   - Ensure you have the DB2 JDBC driver in your classpath (com.ibm.db2.jcc)
+   - DB2 schema names are typically uppercase in queries
+
+2. **Performance**:
+   - For large datasets, consider using `JdbcPagingItemReader` instead of cursor-based reader
+   - Adjust chunk size based on your memory constraints
+
+3. **Error Handling**:
+   - Add appropriate exception handling for DB2-specific errors
+   - Consider implementing skip and retry logic
+
+4. **Transaction Management**:
+   - DB2 often requires explicit transaction management for certain operations
+
+5. **Schema References**:
+   - When querying, you may need to fully qualify table names with schema (e.g., `SCHEMA_NAME.TABLE_NAME`)
+
+This implementation provides a complete solution for reading data from DB2 and writing it to a flat file with custom header and footer rows using Spring Batch 5.2.
