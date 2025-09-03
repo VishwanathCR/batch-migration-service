@@ -117,3 +117,66 @@ Would you like me to also show you a **JobParametersValidator** to ensure only v
 
 
 
+Perfect 👍 Adding a **JobParametersValidator** is a good practice so your job fails fast if the user passes an invalid `sourceType`.
+
+Here’s how you can implement it:
+
+---
+
+### 1. Create a custom validator
+
+```java
+import org.springframework.batch.core.JobParameters;
+import org.springframework.batch.core.JobParametersInvalidException;
+import org.springframework.batch.core.JobParametersValidator;
+
+public class SourceTypeValidator implements JobParametersValidator {
+
+    @Override
+    public void validate(JobParameters parameters) throws JobParametersInvalidException {
+        String sourceType = parameters.getString("sourceType");
+
+        if (sourceType == null) {
+            throw new JobParametersInvalidException("Missing required job parameter: sourceType");
+        }
+
+        if (!("DB".equalsIgnoreCase(sourceType) || "REST".equalsIgnoreCase(sourceType))) {
+            throw new JobParametersInvalidException(
+                    "Invalid sourceType: " + sourceType + ". Allowed values are DB or REST");
+        }
+    }
+}
+```
+
+---
+
+### 2. Register validator with your job
+
+```java
+@Configuration
+public class JobConfig {
+
+    @Bean
+    public Job myJob(JobBuilderFactory jobBuilderFactory,
+                     Step myStep) {
+        return jobBuilderFactory.get("myJob")
+                .validator(new SourceTypeValidator()) // <-- validator here
+                .start(myStep)
+                .build();
+    }
+}
+```
+
+---
+
+### 3. Run job with correct parameter
+
+```bash
+java -jar mybatch.jar --spring.batch.job.name=myJob sourceType=DB
+```
+
+✅ If you pass `sourceType=FILE` or forget it entirely, the job will immediately fail before even starting.
+
+---
+
+Would you like me to also extend this setup so you can **add new readers easily in the future** (e.g., FILE, KAFKA) without modifying the core job config every time?
